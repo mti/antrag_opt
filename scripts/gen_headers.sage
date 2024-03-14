@@ -1,0 +1,435 @@
+## Parameters
+
+import argparse
+parser = argparse.ArgumentParser()
+parser.add_argument("parameter_set", default="1f")
+args = parser.parse_args()
+
+
+# Test parameters
+#D,q = 16, 97
+#D,q = 16, 47
+#D,q = 24, 73
+#D,q = 24, 71
+alpha = 1.4 # not secure
+rad = 0.5*(alpha + 1/alpha)
+sig_margin = 0.5 # not efficient
+
+param = dict()
+
+# Useful parameters
+param['1f'] = 512,  12289, 1.14, 1.006, 0.22,  24
+#param = 512,  5119,  1.22, 1.014, 0.25,  24
+param['1s'] = 512,  3583,  1.26, 1.018, 0.19,  24
+param['2f'] = 648,  9721,  1.18, 1.010, 0.41,  24
+param['2s'] = 648,  3889,  1.29, 1.022, 0.40,  24
+param['3f'] = 768,  18433, 1.14, 1.006, 0.38,  32
+#param = 768,  6911,  1.24, 1.016, 0.52,  32
+param['3s'] = 768,  3329,  1.36, 1.033, 0.38,  32
+param['4f'] = 864, 10369,  1.21, 1.013, 0.40,  32
+param['4s'] = 864,  2593,  1.44, 1.047, 0.37,  32
+param['5f'] = 1024, 12289, 1.21, 1.013, 0.185, 40
+param['5s'] = 1024, 5119,  1.34, 1.031, 0.37,  40
+D, q, alpha, rad, sig_margin, salt_bytes = param[args.parameter_set]
+
+smoothing = 1.32
+
+
+## Derived constants and preliminary tests
+
+if q >= 2^15 or q not in Primes():
+	print("q must be a prime below 2^15")
+	exit(1)
+
+D_fact = dict(factor(D))
+if not all(f in [2,3] for f in D_fact):
+	print("Only values of D of the form 2^a 3^b are supported")
+	exit(1)
+M = 3*D if 3 in D_fact else 2*D
+
+try:
+	ext = next(ext for ext in [1,2] if (q^ext-1) % M == 0)
+except StopIteration:
+	print("q value is invalid (M does not divide q^k-1 for k=1,2)")
+	exit(1)
+if ext == 2 and q % (6 if D % 3 == 0 else 4) == 1:
+	print("q value is inconvenient (ext=2 and q % 4/6 = 1)")
+	exit(1)
+
+prim_pow = [n for n in range(M) if gcd(n,M) == 1]
+tau = 2*pi
+fq = FiniteField(q)
+fqx.<gen> = FiniteField((q, ext))
+g_ntt = fqx.zeta(M)
+
+print(f"D={D}, q={q}, M={M}, ext={ext}")
+
+
+## Utility functions
+
+# inverts digits (bits/trits) in NTT index
+def digit_rev(x, ext):
+	n = D//ext
+	digits = []
+	while n % 3 == 0:
+		digits.append((x % 3, 3))
+		x //= 3
+		n //= 3
+	while n % 2 == 0:
+		digits.append((x % 2, 2))
+		x //= 2
+		n //= 2
+	assert x == 0 and n == 1
+	for d, r in digits:
+		x = x*r + d
+	return x
+
+def serialize_fqx(x):
+	x = x * 2^16
+	if ext == 2:
+		c = x.polynomial().list()
+		if len(c) == 1: c.append(0)
+		return "{"+",".join(map(str, c))+"}"
+	else:
+		return str(int(x))
+
+def serialize_fpc(x):
+	x = CDF(x)
+	return f"{{{{{x.real()}}},{{{x.imag()}}}}}"
+
+def serialize_complex(x):
+	x = CDF(x)
+	return f"{x.real()}+I*{x.imag()}"
+
+def join_commas(it, per_line=8):
+	parts = []
+	for i, x in enumerate(it):
+		parts.append(x)
+		if (i+1) % per_line == 0:
+			parts.append(",\n\t")
+		else:
+			parts.append(", ")
+	parts.pop()
+	return "".join(parts)
+
+def to_monty(x):
+	return (x * 2**16) % q
+
+# finds a Brauer additive chain (ie. next step always involves last number obtained)
+def get_add_chain(e):
+	# assert e <= 12508 # optimality condition
+	chains = {2: (1,2)}
+	while True:
+		new_chains = {}
+		for prev, chain in chains.items():
+			for x in chain:
+				nxt = prev + x
+				if nxt in new_chains:
+					continue
+				if nxt <= e:
+					new_chains[nxt] = (*chain, nxt)
+					if nxt == e:
+						return new_chains[nxt]
+		chains = new_chains
+
+chain_qm2 = get_add_chain(q-2)
+
+
+## Encoding-related constants
+
+# how many bits are needed to store an integer mod q
+q_bits = int(q-1).bit_length()
+
+# 4 i8 vectors (f,g,F,G) + 14 double vectors (intermediary results)
+sk_size = 4*D + 14*D*8
+
+# compressed u16 vector (q_bits per coefficient)
+pk_size = (D*q_bits-1)//8+1 # = ceil(d*q_bits/8)
+
+# can we use memcpy to serialize our doubles on this machine?
+import sys
+simple_double_codec = float.__getformat__("double") == \
+	"IEEE, little-endian" if sys.byteorder == "little" else "IEEE, big-endian"
+
+sig_coef_size = log(sqrt(tau*e*q) * alpha * smoothing, 2)
+small_coef_size = ceil(sig_coef_size - 3)
+if small_coef_size > 14:
+	print("Signature coefficients are too large for codec")
+	exit(1)
+large_coef_size = ceil(sig_coef_size + 0.5)
+sig_vec_size = ceil((sig_coef_size + sig_margin) * D / 8)
+sig_size = sig_vec_size + salt_bytes
+
+
+## RNS-related constants
+
+moduli_cnt = 16
+
+primes = []
+p = previous_prime(2^31)
+while len(primes) < moduli_cnt:
+	if p % M == 1:
+		primes.append(p)
+	p = previous_prime(p)
+
+moduli = []
+rns_root = [] # M-th root of unity for each modulus
+rns_inv2 = [] # inverse of 2
+rns_inv_root6 = [] # inverse of (w-1/w) with w a 6-th root
+rns_inv3 = [] # inverse of 3
+prod = 1
+for p in primes:
+	m_inv_p = pow(-p, 2^31-1, 2^32) # -1/p (mod 2^32)
+	m1 = pow(prod, p-2, p) # 1/prod (mod p)
+	moduli.append((p, m_inv_p, 2^64 % p, m1))
+	F = FiniteField(p)
+	rns_root.append(F.zeta(M))
+	rns_inv2.append(1/F(2))
+	if M % 3 == 0:
+		root6 = F.zeta(6)
+		rns_inv_root6.append(1/(root6 - 1/root6))
+		rns_inv3.append(1/F(3))
+	prod *= p
+
+
+## Write headers
+
+f = open("gen/const.h", "w")
+f.write(
+f"""\
+#ifndef CONST_H
+#define CONST_H
+
+// THIS FILE IS AUTOGENERATED. DO NOT MODIFY MANUALLY.
+
+// dimension parameter
+#define ANTRAG_D        {D}
+// NTRU lattice modulus
+#define ANTRAG_Q        {q}
+// additional parameters
+#define R               {smoothing:.2f}
+#define R_SQUARE        {smoothing^2:.2f}
+#define ANTRAG_ALPHA    {alpha:.2f}
+#define ANTRAG_RADIUS   {rad:.3f}
+
+// prime powers making up the dimension
+#define ANTRAG_LOG2_D   {D_fact[2]}
+#define ANTRAG_LOG3_D   {D_fact.get(3,0)}
+// cyclotomic field conductor
+#define ANTRAG_M        {M}
+// highest multiple of Q which fits in 16 bits
+#define Q_MULT16        {2**16//q*q}
+
+// number of bytes to use for signature salt
+#define SALT_BYTES      {salt_bytes}
+
+// constants for signature/key encoding
+#define ANTRAG_Q_BITS   {q_bits}
+#define ANTRAG_PK_SIZE  {pk_size}
+#define ANTRAG_SK_SIZE  {sk_size}
+#define ANTRAG_SIG_SIZE {sig_size}
+#define SIG_VECTOR_SIZE {sig_vec_size}
+#define SIG_SMALL_BITS  {small_coef_size}
+#define SIG_LARGE_BITS  {large_coef_size}
+#define SIMPLE_DOUBLE_CODEC {1 if simple_double_codec else 0}
+
+#endif
+""")
+
+
+f = open("gen/ntt.h", "w")
+f.write(
+f"""\
+#ifndef NTT_H
+#define NTT_H
+
+// THIS FILE IS AUTOGENERATED. DO NOT MODIFY MANUALLY.
+
+#include <stdint.h>
+
+#include "const.h"
+
+// do we use a quadratic extension in the NTT?
+#define NTT_EXT {1 if ext == 2 else 0}
+// number of values in NTT form
+#define NTT_SIZE {D//ext}
+
+// NTT coefficient type (F_q(x))
+#if NTT_EXT
+	typedef struct {{
+		uint16_t c0;
+		uint16_t c1;
+	}} fqx;
+#else
+	typedef uint16_t fqx;
+#endif
+
+// table of powers of an M-th root of unity
+static const fqx MTH_ROOTS[] = {{
+	{join_commas(serialize_fqx(g_ntt^k) for k in range(M))}
+}};
+
+// ROOT_IDX[i*D/d] is the index in MTH_ROOT to use at index i in NTT of dimension d
+// ROOT_IDX[k] = prim_pow[digit_rev(k, D//ext) * ext]
+// this permutation is necessary to perform the NTT in-place
+static const int ROOT_IDX[] = {{
+	{join_commas(str(prim_pow[digit_rev(k, ext) * ext]) for k in range(D//ext))}
+}};
+
+// used in modular arithmetic routines:
+#define R2 {2**32 % q} // 2^32 % q
+#define M_INV_Q {pow(-q, 2**16//2-1, 2**16)} // -1/q mod 2^16
+
+// 1/(j-j^2) with j a cubic root of unity
+// used in inverse NTT in ternary case
+static const fqx INV_ROOT_DIFF = {serialize_fqx(1 / (g_ntt^(D//2) - g_ntt^(M-D//2)))};
+
+// additive chain used for quick exponentiation in inversion routine
+static const int INV_CHAIN[] = {{{", ".join(
+		str(chain_qm2.index(x2-x1))\
+	for x1, x2 in zip(chain_qm2, chain_qm2[1:])
+)}}};
+#define INV_CHAIN_LEN {len(chain_qm2)}
+
+""")
+
+if ext == 2:
+	fqx_mod = fqx.polynomial().list()
+	assert len(fqx_mod) == 3 and fqx_mod[2] == 1
+	f.write("// coefficients of defining polynomial for quadratic extension\n")
+	f.write(f"#define EXT_REM0 {to_monty(fqx_mod[0])}\n")
+	f.write(f"#define EXT_REM1 {to_monty(fqx_mod[1])}\n")
+
+	assert fqx(1).conjugate() == fqx(1)
+	conj = gen.conjugate().polynomial().list()
+	f.write("// coefficients of conjugate of quadratic extension generator\n")
+	f.write(f"#define EXT_CONJ0 {to_monty(conj[0])}\n")
+	f.write(f"#define EXT_CONJ1 {to_monty(conj[1])}\n")
+
+f.write("\n#endif\n")
+
+
+f = open("gen/fft.h", "w")
+f.write(
+f"""\
+#ifndef FFT_H
+#define FFT_H
+
+// THIS FILE IS AUTOGENERATED. DO NOT MODIFY MANUALLY.
+
+#include <stdint.h>
+
+#include "../falcon/fpr.h"
+#include "const.h"
+
+// number of values in FFT
+#define FFT_SIZE {D//2}
+
+// complex value type (using Falcon floating-point)
+typedef struct {{
+	fpr re;
+	fpr im;
+}} fpc;
+
+// table of powers of an M-th root of unity
+static const fpc MTH_ROOTS[] = {{
+	{join_commas(serialize_fpc(exp(I*tau*k/M)) for k in range(M))}
+}};
+
+// ROOT_IDX[i*D/d] is the index in MTH_ROOT to use at index i in FFT of dimension d
+// ROOT_IDX[k] = prim_pow[digit_rev(k, D//2) * 2]
+// this permutation is necessary to perform the FFT in-place
+static const int ROOT_IDX[] = {{
+	{join_commas(str(prim_pow[digit_rev(k, 2) * 2]) for k in range(D//2))}
+}};
+
+#endif
+""")
+
+
+f = open("gen/ntru.h", "w")
+f.write(
+f"""\
+#ifndef GEN_NTRU_H
+#define GEN_NTRU_H
+
+// THIS FILE IS AUTOGENERATED. DO NOT MODIFY MANUALLY.
+
+#include <stdint.h>
+#include <complex.h>
+
+#include "const.h"
+
+// table of powers of an M-th root of unity
+static const double _Complex MTH_ROOTS[] = {{
+	{join_commas(serialize_complex(exp(I*tau*k/M)) for k in range(M))}
+}};
+
+// ROOT_IDX[i*D/d] is the index in MTH_ROOT to use at index i in FFT of dimension d
+// ROOT_IDX[k] = prim_pow[digit_rev(k, D//2) * 2]
+// this permutation is necessary to perform the FFT in-place
+static const int ROOT_IDX[] = {{
+	{join_commas(str(prim_pow[digit_rev(k, 2) * 2]) for k in range(D//2))}
+}};
+
+#endif
+""")
+
+
+f = open("gen/rns.h", "w")
+f.write(
+f"""\
+#ifndef GEN_RNS_H
+#define GEN_RNS_H
+
+// THIS FILE IS AUTOGENERATED. DO NOT MODIFY MANUALLY.
+
+#include <stdint.h>
+
+// precompted values for each RNS modulus
+typedef struct {{
+	uint32_t q; // modulus
+	uint32_t m_inv_q; // -1/q mod 2^32
+	uint32_t r2; // 2^64 mod q
+	uint32_t m1; // 1/product(previous moduli) mod q
+}} modulus;
+
+#define MAX_MODULI {moduli_cnt}
+
+static const modulus MODULI[MAX_MODULI] = {{
+	{join_commas((
+		"{" + ", ".join(f"{int(x):10}" for x in modulus) + "}"
+		for modulus in moduli
+	), per_line=2)}
+}};
+
+""")
+
+def define_rns_int(name, rems):
+	f.write("static const uint32_t " + name + "[MAX_MODULI] = {")
+	if len(rems) == 0:
+		f.write("};\n")
+		return
+	f.write("\n\t")
+	f.write(join_commas(f"{int(r * 2^32 % q):10}" for r, q in zip(rems, primes)))
+	f.write("\n};\n")
+
+f.write("// M-th root of unity and inverse of 2, used in NTT, per modulus\n")
+define_rns_int("RNS_ROOT", rns_root)
+define_rns_int("RNS_INV2", rns_inv2)
+f.write("// 1/(j-j^2) and 1/3, only used in ternary NTT, per modulus\n")
+define_rns_int("RNS_INV_ROOT6", rns_inv_root6)
+define_rns_int("RNS_INV3", rns_inv3)
+
+f.write(
+f"""\
+// root permutation table (used for in-place NTT)
+static const int ROOT_IDX[] = {{
+	{join_commas(f"{prim_pow[digit_rev(k, 1) * 1]:4}" for k in range(D))}
+}};
+
+#endif
+"""
+)
+
+# vim: ft=python

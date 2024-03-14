@@ -1,0 +1,9 @@
+*~
+*.swp
+build
+main
+gen
+supercop-build
+**/*.sage.py
+scripts/__pycache__
+.vscode
